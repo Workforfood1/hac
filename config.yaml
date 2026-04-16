@@ -1,0 +1,23 @@
+model:
+  yolo_model: "yolov8s.pt"  # Легче, чем yolov8m
+  ocr_lang: "ru"  # PaddleOCR ожидает один язык (например: ru или en)
+  
+video:
+  frame_skip: 1
+  resize_scale: 0.75  # Уменьшаем разрешение для скорости
+  
+stabilization:
+  smooth_window: 3
+  method: "orb"  # Быстрее LightGlue
+  
+ocr:
+  use_paddle: false  # Для быстрого и стабильного старта; включите true после загрузки моделей PaddleOCR
+  confidence_threshold: 0.3
+  
+post_processing:
+  temporal_window: 5
+  confidence_threshold: 0.5
+  
+output:
+  format: "json"  # или "csv"
+  include_confidence: true
