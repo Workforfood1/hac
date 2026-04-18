@@ -12,6 +12,7 @@ import os
 import sys
 import re
 import argparse
+import time
 import warnings
 import logging
 from pathlib import Path
@@ -26,8 +27,8 @@ warnings.filterwarnings("ignore")
 logging.getLogger("easyocr").setLevel(logging.ERROR)
 
 # ─── Paths ─────────────────────────────────────────────────────────────────
-BASE = Path(r"C:\Users\okudz\Desktop\хакатон\Хакатон «ИИ – АВТОМАТИЗАЦИЯ»\Задание 2")
-OUTPUT_DIR = Path(r"C:\Users\okudz\Desktop\хакатон\task2-full\results")
+BASE = Path(r"C:\Users\kudzh_o\Documents\GitHub\hac\Хакатон «ИИ – АВТОМАТИЗАЦИЯ»\Задание 2")
+OUTPUT_DIR = Path(r"C:\Users\kudzh_o\Documents\GitHub\hac\results")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
@@ -35,6 +36,212 @@ def load_easyocr():
     import easyocr
     reader = easyocr.Reader(['ru', 'en'], gpu=False, verbose=False)
     return reader
+
+
+class OCRAdapter:
+    """Adapter to provide unified `readtext(frame)` across OCR backends.
+
+    Supported backends: 'easyocr' (default), 'paddlevl' (PaddleOCR variant).
+    """
+    def __init__(self, backend='easyocr', det_model_dir=None, rec_model_dir=None):
+        self.backend = backend
+        self._impl = None
+        self._det_model_dir = det_model_dir
+        self._rec_model_dir = rec_model_dir
+        if backend == 'easyocr':
+            try:
+                import easyocr
+                self._impl = easyocr.Reader(['ru', 'en'], gpu=False, verbose=False)
+            except Exception as e:
+                raise RuntimeError(f"Failed to init EasyOCR: {e}")
+        elif backend in ('paddlevl', 'paddle'):
+            try:
+                from paddleocr import PaddleOCR
+                # Use a generic PaddleOCR initialization; allow specifying model dirs
+                kwargs = {'use_angle_cls': False, 'lang': 'ru'}
+                if self._det_model_dir:
+                    kwargs['det_model_dir'] = str(self._det_model_dir)
+                if self._rec_model_dir:
+                    kwargs['rec_model_dir'] = str(self._rec_model_dir)
+                self._impl = PaddleOCR(**kwargs)
+            except Exception as e:
+                raise RuntimeError(f"Failed to init PaddleOCR: {e}")
+        elif backend in ('tesseract', 'pytesseract'):
+            try:
+                import pytesseract
+                from pytesseract import Output
+                from pathlib import Path
+                # Allow user to override tesseract binary via environment var
+                tcmd = os.environ.get('TESSERACT_CMD')
+                if not tcmd:
+                    # Try to find tesseract automatically
+                    candidates = [
+                        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+                        r"C:\tesseract-5.5.2\tesseract.exe",
+                        r"D:\tesseract-5.5.2\tesseract.exe",
+                        r"E:\tesseract-5.5.2\tesseract.exe",
+                    ]
+                    for candidate in candidates:
+                        if Path(candidate).exists():
+                            tcmd = candidate
+                            print(f"Found Tesseract at: {tcmd}")
+                            break
+                if tcmd:
+                    pytesseract.pytesseract.tesseract_cmd = tcmd
+                self._impl = pytesseract
+                self._tcmd = tcmd or 'tesseract'
+                self._tesseract_output = Output
+                # Check if Russian language data is available
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        [self._tcmd, '--list-langs'],
+                        capture_output=True, text=True, timeout=10,
+                        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP') else 0,
+                    )
+                    self._has_rus_lang = 'rus' in result.stdout
+                except Exception:
+                    self._has_rus_lang = False
+            except Exception as e:
+                raise RuntimeError(f"Failed to init pytesseract: {e}")
+        else:
+            raise ValueError(f"Unknown OCR backend: {backend}")
+
+    def readtext(self, frame_rgb, detail=1, paragraph=False, allowlist=None):
+        """Return list of (bbox, text, conf) similar to EasyOCR format."""
+        if self.backend == 'easyocr':
+            return self._impl.readtext(frame_rgb, detail=1, paragraph=False)
+
+        if self.backend in ('tesseract', 'pytesseract'):
+            # Call tesseract directly via subprocess to avoid Python 3.12+Windows
+            # KeyboardInterrupt bug in pytesseract's subprocess.communicate()
+            return self._tesseract_readtext_direct(frame_rgb)
+
+        # PaddleOCR: convert output to (bbox, text, conf)
+        # Different PaddleOCR versions accept different kwargs; call without 'cls'
+        try:
+            results = self._impl.ocr(frame_rgb)
+        except TypeError:
+            results = self._impl.ocr(frame_rgb, cls=False)
+        out = []
+        if not results:
+            return out
+
+        def extract_from_item(item):
+            # item can be (box, (text, score)) or (box, text, score) or nested lists
+            if not item:
+                return None
+            # If it's a 3-tuple like (box, text, score)
+            if isinstance(item, (list, tuple)) and len(item) == 3 and isinstance(item[0], (list, tuple)):
+                box = item[0]
+                text = item[1]
+                try:
+                    conf = float(item[2])
+                except Exception:
+                    conf = 0.0
+                return (box, str(text), conf)
+            # If it's (box, (text, score))
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                box = item[0]
+                txt_score = item[1]
+                if isinstance(txt_score, (list, tuple)) and len(txt_score) >= 2:
+                    try:
+                        confv = float(txt_score[1])
+                    except Exception:
+                        confv = 0.0
+                    return (box, str(txt_score[0]), confv)
+                else:
+                    return (box, str(txt_score), 0.0)
+            return None
+
+        # Results may be nested: either list of lines or list of pages
+        for entry in results:
+            # If entry itself looks like a single detection
+            det = extract_from_item(entry)
+            if det:
+                out.append(det)
+                continue
+            # Otherwise, try to iterate sub-items
+            if isinstance(entry, (list, tuple)):
+                for sub in entry:
+                    det = extract_from_item(sub)
+                    if det:
+                        out.append(det)
+        return out
+
+    def _tesseract_readtext_direct(self, frame_rgb):
+        """Call tesseract via subprocess directly to avoid pytesseract's
+        subprocess.communicate() KeyboardInterrupt bug on Python 3.12 + Windows."""
+        import subprocess
+        import tempfile
+        import csv
+        tcmd = self._tcmd
+        try:
+            img = Image.fromarray(frame_rgb)
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp_in:
+                tmp_in_path = tmp_in.name
+                img.save(tmp_in_path)
+            with tempfile.NamedTemporaryFile(suffix='', delete=False) as tmp_out:
+                tmp_out_path = tmp_out.name
+            # Determine available langs
+            langs = 'rus+eng' if self._has_rus_lang else 'eng'
+            proc = subprocess.Popen(
+                [tcmd, tmp_in_path, tmp_out_path, '--oem', '3', '--psm', '11',
+                 '-l', langs, 'tsv'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if hasattr(subprocess, 'CREATE_NEW_PROCESS_GROUP') else 0,
+            )
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                return []
+            except KeyboardInterrupt:
+                proc.kill()
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
+                return []
+            tsv_path = tmp_out_path + '.tsv'
+            out = []
+            try:
+                import os as _os
+                if _os.path.exists(tsv_path):
+                    with open(tsv_path, encoding='utf-8', newline='') as f:
+                        reader_csv = csv.DictReader(f, delimiter='\t')
+                        for row in reader_csv:
+                            txt = str(row.get('text', '')).strip()
+                            if not txt:
+                                continue
+                            try:
+                                conf = float(row.get('conf', 0)) / 100.0
+                            except Exception:
+                                conf = 0.0
+                            if conf < 0:
+                                continue
+                            try:
+                                x = int(row.get('left', 0))
+                                y = int(row.get('top', 0))
+                                w = int(row.get('width', 0))
+                                h = int(row.get('height', 0))
+                            except Exception:
+                                continue
+                            box = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+                            out.append((box, txt, conf))
+            finally:
+                import os as _os
+                for p in [tmp_in_path, tmp_out_path, tsv_path]:
+                    try:
+                        _os.unlink(p)
+                    except Exception:
+                        pass
+            return out
+        except (Exception, KeyboardInterrupt):
+            return []
 
 
 def read_video_frame(cap, frame_idx):
@@ -52,6 +259,24 @@ def pil_save(frame_rgb, path):
 
 def ocr_frame(reader, frame_rgb):
     """Run EasyOCR on a full frame. Returns list of (bbox, text, conf)."""
+    max_dim = max(frame_rgb.shape[:2]) if getattr(frame_rgb, 'shape', None) is not None else 0
+    if max_dim > 1400:
+        scale = 1400.0 / float(max_dim)
+        resized = cv2.resize(frame_rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        result = reader.readtext(resized, detail=1, paragraph=False)
+        scaled_result = []
+        inv_scale = 1.0 / scale
+        for item in result:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                continue
+            bbox, text, conf = item[0], item[1], item[2]
+            try:
+                scaled_bbox = [[float(x) * inv_scale, float(y) * inv_scale] for x, y in bbox]
+            except Exception:
+                scaled_bbox = bbox
+            scaled_result.append((scaled_bbox, text, conf))
+        return scaled_result
+
     result = reader.readtext(frame_rgb, detail=1, paragraph=False)
     return result
 
@@ -82,7 +307,13 @@ def parse_number(text):
 def bbox_center(bbox):
     """Get center of a polygon bbox returned by EasyOCR."""
     pts = np.array(bbox)
-    return pts.mean(axis=0)
+    # Handle empty/invalid bbox gracefully
+    if pts.size == 0:
+        return np.array([0.0, 0.0])
+    try:
+        return pts.mean(axis=0)
+    except Exception:
+        return np.array([0.0, 0.0])
 
 
 def build_number_map(ocr_results):
@@ -256,7 +487,7 @@ def label_regions_from_text(regions, text_items, params, label_radius=120):
     return labeled
 
 
-def process_video(video_idx, frame_step=None, max_frames=None):
+def process_video(video_idx, frame_step=None, max_frames=None, reader=None):
     """
     Process one video and fill the corresponding Excel table.
     
@@ -290,10 +521,11 @@ def process_video(video_idx, frame_step=None, max_frames=None):
     
     print(f"  Frame step: {frame_step} (sampling every {frame_step/fps:.2f}s)")
     
-    # Initialize OCR
+    # Initialize OCR (use provided reader or default to EasyOCR adapter)
     print("  Loading OCR model...")
-    reader = load_easyocr()
-    print("  OCR ready.")
+    if reader is None:
+        reader = OCRAdapter('easyocr')
+    print(f"  OCR ready ({getattr(reader, 'backend', 'easyocr')}).")
     
     # Collect data: list of (frame_idx, timestamp, {param_name: value})
     all_rows = []
@@ -463,26 +695,44 @@ def process_video_smart(video_idx, frame_step=None, max_frames=None, reader=None
     # ── Step 1: Full OCR on the first few frames to build layout ──────────
     print("  Building layout from first frame...")
     
-    # Read first valid frame
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    ret = False
-    bgr = None
-    for attempt in range(5):
+    # Read several early frames and keep the one with the richest numeric layout.
+    candidate_indices = []
+    for seconds in (0, 1, 2, 3, 5):
+        candidate_idx = int(seconds * fps)
+        if candidate_idx < total_frames and candidate_idx not in candidate_indices:
+            candidate_indices.append(candidate_idx)
+
+    best_layout = None
+    for candidate_idx in candidate_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, candidate_idx)
         ret, bgr = cap.read()
-        if ret:
+        if not ret or bgr is None:
+            continue
+
+        candidate_frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        text_items_candidate, num_items_candidate = auto_detect_layout(reader, candidate_frame, params)
+        score = len(num_items_candidate)
+        if best_layout is None or score > best_layout['score']:
+            best_layout = {
+                'frame_idx': candidate_idx,
+                'frame_rgb': candidate_frame,
+                'text_items': text_items_candidate,
+                'num_items': num_items_candidate,
+                'score': score,
+            }
+
+        if score >= max(5, min(20, len(params) // 6)):
             break
-    
-    if not ret:
-        print("  ERROR: Cannot read first frame")
+
+    if best_layout is None:
+        print("  ERROR: Cannot read initial frames for layout detection")
         cap.release()
         return []
-    if bgr is None:
-        print("  ERROR: First frame buffer is empty")
-        cap.release()
-        return []
-    
-    first_frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    text_items, num_items = auto_detect_layout(reader, first_frame, params)
+
+    first_frame = best_layout['frame_rgb']
+    text_items = best_layout['text_items']
+    num_items = best_layout['num_items']
+    print(f"  Layout source frame: {best_layout['frame_idx']}")
     
     print(f"  Found {len(num_items)} numeric positions in first frame")
     
@@ -532,6 +782,7 @@ def process_video_smart(video_idx, frame_step=None, max_frames=None, reader=None
         timestamp = frame_idx / fps
         frame_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         frame_pil = Image.fromarray(frame_rgb)
+        frame_started_at = time.perf_counter()
         
         row_data = {
             '_frame': frame_idx,
@@ -566,6 +817,8 @@ def process_video_smart(video_idx, frame_step=None, max_frames=None, reader=None
                     row_data[f'reg_{reg_idx+1}'] = None
             except Exception:
                 row_data[f'reg_{reg_idx+1}'] = None
+
+        row_data['_frame_processing_seconds'] = round(time.perf_counter() - frame_started_at, 4)
         
         all_rows.append(row_data)
         processed += 1
@@ -588,6 +841,7 @@ def process_video_smart(video_idx, frame_step=None, max_frames=None, reader=None
 
 def save_smart_results(all_rows, regions, params, output_path, video_idx):
     from openpyxl.styles import PatternFill, Font, Alignment
+    import time
     
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -598,7 +852,7 @@ def save_smart_results(all_rows, regions, params, output_path, video_idx):
     n_regions = len(regions)
     
     # Build header: frame, timestamp, reg_1...reg_N
-    headers = ['Кадр', 'Время']
+    headers = ['Кадр', 'Время', 'Обработка кадра, сек']
     for i, reg in enumerate(regions):
         label = reg.get('label', '')
         param = reg.get('param_name', '')
@@ -624,13 +878,17 @@ def save_smart_results(all_rows, regions, params, output_path, video_idx):
     
     # Data
     for row in all_rows:
-        data = [row['_frame'], row['_timestamp']]
+        data = [
+            row['_frame'],
+            row['_timestamp'],
+            row.get('_frame_processing_seconds', ''),
+        ]
         for i in range(1, n_regions + 1):
             data.append(row.get(f'reg_{i}', ''))
         ws.append(data)
     
-    # Freeze first row and first two columns
-    ws.freeze_panes = 'C2'
+    # Freeze first row and metadata columns
+    ws.freeze_panes = 'D2'
     
     # Regions info sheet
     ws2 = wb.create_sheet("Позиции регионов")
@@ -647,10 +905,17 @@ def save_smart_results(all_rows, regions, params, output_path, video_idx):
     for i, p in enumerate(params, 1):
         ws3.append([i, p['name'], p['unit'], p['short']])
     
-    wb.save(output_path)
+    # Try to remove existing file to avoid PermissionError; if unable, append timestamp
+    try:
+        if output_path.exists():
+            output_path.unlink()
+        wb.save(output_path)
+    except PermissionError:
+        alt = output_path.with_name(output_path.stem + f"_{int(time.time())}" + output_path.suffix)
+        wb.save(alt)
 
 
-def process_video_full_ocr(video_idx, frame_step=None, max_frames=None):
+def process_video_full_ocr(video_idx, frame_step=None, max_frames=None, reader=None):
     """
     Full OCR per frame — no pre-built layout.
     Reads ALL numbers from each frame and associates them with table parameters.
@@ -682,8 +947,9 @@ def process_video_full_ocr(video_idx, frame_step=None, max_frames=None):
     if frame_step is None:
         frame_step = max(1, int(fps))  # 1 sample/second
     
-    print("  Loading EasyOCR (ru+en)...")
-    reader = load_easyocr()
+    print("  Loading OCR (ru+en)...")
+    if reader is None:
+        reader = OCRAdapter('easyocr')
     
     all_rows = []
     frame_idx = 0

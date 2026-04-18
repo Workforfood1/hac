@@ -36,10 +36,32 @@ pip install -r requirements.txt
 
 ## Использование
 
-### Базовая обработка
+### Полный запуск проекта
 
 ```bash
-python main.py input.mp4
+python main.py
+```
+
+По умолчанию запускается хакатонный пайплайн для `Видео 1`, `Видео 2`, `Видео 3` в режиме `smart` с OCR backend `easyocr`.
+
+### Сравнение двух моделей на `Видео 3`
+
+```bash
+python main.py compare-video3 --models easyocr paddlevl
+```
+
+Результат сравнения сохраняется в `results/ab_test_video3.xlsx`.
+
+### Хакатонный запуск с параметрами
+
+```bash
+python main.py hackathon --videos 1 2 3 --mode smart --ocr-backend easyocr
+```
+
+### Базовая legacy-обработка
+
+```bash
+python main.py legacy input.mp4
 ```
 
 Результаты сохранятся в `results.json`

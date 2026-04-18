@@ -3,7 +3,7 @@ model:
   ocr_lang: "ru"  # PaddleOCR ожидает один язык (например: ru или en)
   
 video:
-  frame_skip: 1
+  frame_skip: 2
   resize_scale: 0.75  # Уменьшаем разрешение для скорости
   
 stabilization:
